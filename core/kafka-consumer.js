@@ -96,6 +96,32 @@ function createConsumer(serviceName, groupId) {
         // Start from earliest offset for new groups (important for replay)
         // This means new consumers will read ALL historical messages
         // For existing groups, Kafka remembers the last committed offset
+
+        // -------------------------------------------------------------------
+        // SELF-HEAL ON CRASH
+        // -------------------------------------------------------------------
+        // On a single-broker dev cluster, a consumer that joins before the
+        // group coordinator / __consumer_offsets topic is ready can crash
+        // with "group coordinator is not available". The HTTP server stays
+        // up, so Docker's restart policy never fires and the service sits
+        // there healthy-looking but not consuming.
+        //
+        // restartOnFailure MUST live here in the consumer config — kafkajs
+        // ignores a `retry` key passed to consumer.run() (that was the bug:
+        // event-ingestor crashed at cold boot and never recovered).
+        // -------------------------------------------------------------------
+        retry: {
+            initialRetryTime: 300,
+            retries: 10,
+            maxRetryTime: 30000,
+            factor: 2,
+            restartOnFailure: async (error) => {
+                logger.warn('Consumer crashed — restarting consumer loop', {
+                    error: error.message,
+                });
+                return true;
+            },
+        },
     });
 
     // Track subscribed topics and connection state
@@ -195,24 +221,8 @@ function createConsumer(serviceName, groupId) {
                 // Manual offset management for at-least-once delivery
                 autoCommit,
 
-                // ---------------------------------------------------------------
-                // SELF-HEAL ON CRASH
-                // ---------------------------------------------------------------
-                // On a single-broker dev cluster, a consumer that joins before
-                // the group coordinator / __consumer_offsets topic is ready can
-                // crash with "group coordinator is not available". Because the
-                // HTTP server stays up, Docker's restart policy never fires and
-                // the service would sit there healthy-looking but not consuming.
-                // Returning true here tells KafkaJS to restart the consumer loop
-                // itself, so the service recovers unattended on cold boot.
-                retry: {
-                    restartOnFailure: async (error) => {
-                        logger.warn('Consumer crashed — restarting consumer loop', {
-                            error: error.message,
-                        });
-                        return true;
-                    },
-                },
+                // (Self-heal restartOnFailure lives in the kafka.consumer()
+                // config above — kafkajs ignores a retry key here in run().)
 
                 // ---------------------------------------------------------------
                 // MESSAGE HANDLER

@@ -36,8 +36,10 @@ async function initTopics() {
                 replicationFactor: 1,
             },
             {
+                // 1 partition — must match docker-compose kafka-init:
+                // system-events is low volume and needs strict global ordering
                 topic: 'system-events',
-                numPartitions: 3,
+                numPartitions: 1,
                 replicationFactor: 1,
             }
         ];

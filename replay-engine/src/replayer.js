@@ -94,8 +94,9 @@ const QUERIES = {
 
     GET_REPLAY_SESSIONS: `SELECT * FROM replay_sessions ORDER BY started_at DESC LIMIT $1 OFFSET $2`,
 
-    // Idempotency check in PostgreSQL (fallback if Redis is unavailable)
-    CHECK_PROCESSED: `SELECT event_id FROM processed_events WHERE event_id = $1`,
+    // Idempotency check in PostgreSQL (fallback if Redis is unavailable).
+    // Only successful processing counts — a FAILED row must not block a retry.
+    CHECK_PROCESSED: `SELECT event_id FROM processed_events WHERE event_id = $1 AND result = 'SUCCESS'`,
 
     MARK_PROCESSED: `
         INSERT INTO processed_events (event_id, processed_by, result, error_message)
@@ -134,8 +135,12 @@ function createReplayer(idempotencyChecker) {
     //   2. Register it in the handlerRegistry below
     //   3. The replayer will automatically route events to it
     // =========================================================================
-    const orderReplayHandler = createOrderReplayHandler();
-    const paymentReplayHandler = createPaymentReplayHandler();
+    // Handlers receive a pool getter so state-rebuild mode can persist to
+    // the orders/payments tables. A getter (not the pool itself) because
+    // the pool doesn't exist until connect() runs.
+    const getPool = () => pool;
+    const orderReplayHandler = createOrderReplayHandler(getPool);
+    const paymentReplayHandler = createPaymentReplayHandler(getPool);
 
     const handlerRegistry = {
         // Order events
@@ -293,11 +298,26 @@ function createReplayer(idempotencyChecker) {
                     //   - Corrupted aggregate state
                     //
                     // Check order: Redis (fast) → PostgreSQL (fallback)
+                    //
+                    // MODE-AWARE DEDUP:
+                    //   dry-run       → never skip. Dry runs are pure
+                    //                   simulations; engineers expect to
+                    //                   re-run them freely.
+                    //   state-rebuild → skip if ANY prior replay already
+                    //                   applied this event. Keys are GLOBAL
+                    //                   (not session-scoped) so dedup works
+                    //                   across replay sessions, and the PG
+                    //                   processed_events table is consulted
+                    //                   when Redis misses (restart/TTL expiry).
                     // ---------------------------------------------------------
-                    const alreadyProcessed = await idempotencyChecker.isProcessed(
-                        event.event_id,
-                        sessionId
-                    );
+                    let alreadyProcessed = false;
+                    if (mode === 'state-rebuild') {
+                        alreadyProcessed = await idempotencyChecker.isProcessed(event.event_id);
+                        if (!alreadyProcessed) {
+                            const pgCheck = await pool.query(QUERIES.CHECK_PROCESSED, [event.event_id]);
+                            alreadyProcessed = pgCheck.rows.length > 0;
+                        }
+                    }
 
                     if (alreadyProcessed) {
                         // Event already processed — skip it
@@ -377,16 +397,22 @@ function createReplayer(idempotencyChecker) {
                     // ---------------------------------------------------------
                     processedCount++;
 
-                    // Mark as processed in Redis (for future idempotency checks)
-                    await idempotencyChecker.markProcessed(event.event_id, sessionId);
+                    // Only state-rebuild leaves an idempotency footprint —
+                    // dry-run makes no state changes, so recording it would
+                    // wrongly block future rebuilds. Keys are global so the
+                    // dedup holds across sessions.
+                    if (mode === 'state-rebuild') {
+                        // Mark as processed in Redis (for future idempotency checks)
+                        await idempotencyChecker.markProcessed(event.event_id);
 
-                    // Mark as processed in PostgreSQL (persistent backup)
-                    await pool.query(QUERIES.MARK_PROCESSED, [
-                        event.event_id,
-                        'replay-engine',
-                        'SUCCESS',
-                        null,
-                    ]);
+                        // Mark as processed in PostgreSQL (persistent backup)
+                        await pool.query(QUERIES.MARK_PROCESSED, [
+                            event.event_id,
+                            'replay-engine',
+                            'SUCCESS',
+                            null,
+                        ]);
+                    }
 
                     timeline.push({
                         event_id: event.event_id,
@@ -411,13 +437,16 @@ function createReplayer(idempotencyChecker) {
                     // ---------------------------------------------------------
                     failedCount++;
 
-                    // Mark as failed in PostgreSQL
-                    await pool.query(QUERIES.MARK_PROCESSED, [
-                        event.event_id,
-                        'replay-engine',
-                        'FAILED',
-                        error.message,
-                    ]).catch(() => {}); // Don't fail the loop on recording failure
+                    // Record the failure in PostgreSQL (audit only — a FAILED
+                    // row never blocks a retry; CHECK_PROCESSED filters on SUCCESS)
+                    if (mode === 'state-rebuild') {
+                        await pool.query(QUERIES.MARK_PROCESSED, [
+                            event.event_id,
+                            'replay-engine',
+                            'FAILED',
+                            error.message,
+                        ]).catch(() => {}); // Don't fail the loop on recording failure
+                    }
 
                     timeline.push({
                         event_id: event.event_id,

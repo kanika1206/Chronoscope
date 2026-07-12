@@ -2,6 +2,18 @@ const API_BASE = window.location.origin;
 
 let currentCorrelationId = null;
 
+// Escape untrusted values before interpolating into innerHTML.
+// Event payloads and IDs originate from API callers, so they are
+// attacker-controlled — rendering them raw is a stored-XSS vector.
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 async function fetchStats() {
     try {
         const res = await fetch('/stats');
@@ -27,13 +39,13 @@ async function fetchFlows() {
         
         if (data.success && data.flows.length > 0) {
             flowsList.innerHTML = data.flows.map(flow => `
-                <div class="flow-item ${flow.has_failure ? 'failed' : ''}" onclick="showTimeline('${flow.correlation_id}')">
-                    <div style="font-family: monospace; color: #718096; font-size: 0.9em;">${flow.correlation_id}</div>
+                <div class="flow-item ${flow.has_failure ? 'failed' : ''}" onclick="showTimeline('${escapeHtml(flow.correlation_id).replace(/'/g, '')}')">
+                    <div style="font-family: monospace; color: #718096; font-size: 0.9em;">${escapeHtml(flow.correlation_id)}</div>
                     <div style="margin-top: 5px;">
-                        <strong>${flow.event_count} events</strong> across ${flow.services.map(s => `<span class="badge">${s}</span>`).join(' ')}
+                        <strong>${escapeHtml(flow.event_count)} events</strong> across ${flow.services.map(s => `<span class="badge">${escapeHtml(s)}</span>`).join(' ')}
                     </div>
                     <div style="margin-top: 5px; font-size: 0.85em; color: ${flow.has_failure ? '#e53e3e' : '#48bb78'};">
-                        ${flow.has_failure ? 'Failed' : 'Success'} - Duration: ${flow.duration_ms}ms
+                        ${flow.has_failure ? 'Failed' : 'Success'} - Duration: ${escapeHtml(flow.duration_ms)}ms
                     </div>
                 </div>
             `).join('');
@@ -51,7 +63,7 @@ async function showTimeline(correlationId) {
     document.getElementById('dashboard-controls').style.display = 'none';
     document.getElementById('flows-section').style.display = 'none';
     document.getElementById('timeline-section').style.display = 'block';
-    document.getElementById('timeline-title').textContent = `Timeline: ${correlationId}`;
+    document.getElementById('timeline-title').textContent = `Timeline: ${correlationId}`; // textContent — safe, no escaping needed
     
     document.getElementById('timeline-container').innerHTML = 'Loading timeline...';
     document.getElementById('replay-results').innerHTML = '';
@@ -66,16 +78,16 @@ async function showTimeline(correlationId) {
                 <div class="timeline-event ${event.is_failure ? 'failed' : ''}">
                     <div class="timeline-content">
                         <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
-                            <strong>${event.event_type}</strong>
-                            <span class="badge">${event.service}</span>
+                            <strong>${escapeHtml(event.event_type)}</strong>
+                            <span class="badge">${escapeHtml(event.service)}</span>
                         </div>
-                        <p style="font-size: 0.9em; margin-bottom: 5px;">${event.description}</p>
+                        <p style="font-size: 0.9em; margin-bottom: 5px;">${escapeHtml(event.description)}</p>
                         <p style="font-size: 0.8em; color: #718096;">
-                            Step ${event.step_number} - Time: ${new Date(parseInt(event.timestamp) || event.timestamp).toLocaleTimeString()}
+                            Step ${escapeHtml(event.step_number)} - Time: ${new Date(parseInt(event.timestamp) || event.timestamp).toLocaleTimeString()}
                         </p>
                         <details style="margin-top: 10px;">
                             <summary style="cursor: pointer; font-size: 0.85em; color: #4a5568;">Show Payload</summary>
-                            <pre style="background: #edf2f7; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 0.8em; margin-top: 5px;">${JSON.stringify(event.payload, null, 2)}</pre>
+                            <pre style="background: #edf2f7; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 0.8em; margin-top: 5px;">${escapeHtml(JSON.stringify(event.payload, null, 2))}</pre>
                         </details>
                     </div>
                 </div>
@@ -111,9 +123,9 @@ async function triggerReplay(mode) {
         if (data.success) {
             let details = data.timeline?.map(item => `
                 <div style="padding: 5px 0; border-bottom: 1px solid #e2e8f0; font-size: 0.9em;">
-                    <strong>${item.event_type}</strong> (${item.service}) - 
+                    <strong>${escapeHtml(item.event_type)}</strong> (${escapeHtml(item.service)}) -
                     <span style="color: ${item.status === 'PROCESSED' ? 'green' : (item.status === 'FAILED' ? 'red' : 'orange')}">
-                        ${item.status}
+                        ${escapeHtml(item.status)}
                     </span>
                 </div>
             `).join('') || '';
@@ -126,10 +138,10 @@ async function triggerReplay(mode) {
                 </div>
             `;
         } else {
-            resultsDiv.innerHTML = `<p style="color: red;">Replay failed: ${data.error}</p>`;
+            resultsDiv.innerHTML = `<p style="color: red;">Replay failed: ${escapeHtml(data.error)}</p>`;
         }
     } catch (e) {
-        resultsDiv.innerHTML = `<p style="color: red;">Error triggering replay: ${e.message}</p>`;
+        resultsDiv.innerHTML = `<p style="color: red;">Error triggering replay: ${escapeHtml(e.message)}</p>`;
     }
 }
 

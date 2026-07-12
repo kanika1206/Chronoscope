@@ -35,8 +35,34 @@ const { createLogger } = require('@chronoscope/core');
 // =============================================================================
 // createOrderReplayHandler() — Factory function
 // =============================================================================
-function createOrderReplayHandler() {
+// PARAMETERS:
+//   @param {function} getPool — Returns the shared pg Pool (lazy: the pool
+//                               is created by the replayer's connect())
+function createOrderReplayHandler(getPool) {
     const logger = createLogger('order-replay-handler');
+
+    // Upsert the full order row (used by ORDER_CREATED)
+    const UPSERT_ORDER = `
+        INSERT INTO orders (order_id, customer_id, items, total_amount, status, correlation_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+        ON CONFLICT (order_id) DO UPDATE
+        SET customer_id = EXCLUDED.customer_id,
+            items = EXCLUDED.items,
+            total_amount = EXCLUDED.total_amount,
+            status = EXCLUDED.status,
+            updated_at = EXCLUDED.updated_at
+    `;
+
+    // Status-only transition (used by UPDATED / CANCELLED / COMPLETED).
+    // Upsert rather than UPDATE so a rebuild works even when the original
+    // ORDER_CREATED event is outside the replayed correlation window.
+    const UPSERT_ORDER_STATUS = `
+        INSERT INTO orders (order_id, customer_id, status, updated_at)
+        VALUES ($1, 'unknown', $2, $3)
+        ON CONFLICT (order_id) DO UPDATE
+        SET status = EXCLUDED.status,
+            updated_at = EXCLUDED.updated_at
+    `;
 
     return {
         // =====================================================================
@@ -97,12 +123,18 @@ function createOrderReplayHandler() {
                 // =============================================================
                 // STATE-REBUILD: Actually recreate the order record
                 // =============================================================
-                // In a full implementation, this would INSERT/UPSERT into
-                // the orders table in PostgreSQL.
-                //
-                // For now, we return the state that would be created.
-                // To implement fully, inject the database pool into this handler.
-                // =============================================================
+                const createdAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_ORDER, [
+                    orderId,
+                    customerId,
+                    JSON.stringify(items || []),
+                    totalAmount,
+                    'PENDING',
+                    event.correlation_id,
+                    createdAt,
+                ]);
+
                 return {
                     action: 'CREATE_ORDER',
                     description: `Order ${orderId} state rebuilt`,
@@ -113,7 +145,7 @@ function createOrderReplayHandler() {
                         totalAmount,
                         status: 'PENDING',
                         correlationId: event.correlation_id,
-                        createdAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        createdAt,
                     },
                     applied: true,
                 };
@@ -155,13 +187,21 @@ function createOrderReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const updatedAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_ORDER_STATUS, [
+                    orderId,
+                    currentState?.status || 'PENDING',
+                    updatedAt,
+                ]);
+
                 return {
                     action: 'UPDATE_ORDER',
                     description: `Order ${orderId} state updated`,
                     stateUpdated: {
                         orderId,
                         ...currentState,
-                        updatedAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        updatedAt,
                     },
                     applied: true,
                 };
@@ -204,6 +244,10 @@ function createOrderReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const updatedAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_ORDER_STATUS, [orderId, 'CANCELLED', updatedAt]);
+
                 return {
                     action: 'CANCEL_ORDER',
                     description: `Order ${orderId} cancelled`,
@@ -211,7 +255,7 @@ function createOrderReplayHandler() {
                         orderId,
                         status: 'CANCELLED',
                         cancelReason: reason,
-                        updatedAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        updatedAt,
                     },
                     applied: true,
                 };
@@ -243,13 +287,17 @@ function createOrderReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const updatedAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_ORDER_STATUS, [orderId, 'COMPLETED', updatedAt]);
+
                 return {
                     action: 'COMPLETE_ORDER',
                     description: `Order ${orderId} completed`,
                     stateUpdated: {
                         orderId,
                         status: 'COMPLETED',
-                        updatedAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        updatedAt,
                     },
                     applied: true,
                 };

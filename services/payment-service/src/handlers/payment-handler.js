@@ -71,6 +71,18 @@ function createPaymentHandler(producer, serviceName, options = {}) {
     const payments = new Map();
 
     // =========================================================================
+    // PENDING CANCELLATIONS — closes the cancel-vs-payment race
+    // =========================================================================
+    // If ORDER_CANCELLED arrives while the payment gateway call is still in
+    // flight, the cancellation handler finds no SUCCESS payment and would
+    // previously just return — leaving the customer charged with no refund
+    // once the gateway call completed. We record the cancellation here so
+    // onOrderCreated can refund immediately after a late success.
+    // KEY: orderId → cancellation reason
+    // =========================================================================
+    const cancelledOrders = new Map();
+
+    // =========================================================================
     // SIMULATED EXTERNAL SERVICES
     // =========================================================================
     // These functions simulate real external service calls.
@@ -140,6 +152,56 @@ function createPaymentHandler(producer, serviceName, options = {}) {
             correlation_id: event.correlation_id,
         });
         // In production: await axios.post(webhookUrl, event)
+    }
+
+    /**
+     * Refunds a successful payment: calls the refund API (skipped in replay
+     * mode), updates the payment record, and emits PAYMENT_REFUNDED.
+     * Shared by onOrderCancelled and the cancel-vs-payment race path in
+     * onOrderCreated.
+     */
+    async function processRefund(payment, reason, correlationId) {
+        if (!replayMode) {
+            logger.info('Processing refund...', {
+                paymentId: payment.paymentId,
+                amount: payment.amount,
+            });
+            // In production: await stripe.refunds.create({ charge: payment.transactionRef })
+            await new Promise(resolve => setTimeout(resolve, 500));
+        } else {
+            logger.info('[REPLAY MODE] Skipping refund API call', {
+                paymentId: payment.paymentId,
+                amount: payment.amount,
+            });
+        }
+
+        payment.status = 'REFUNDED';
+        payment.refundedAt = new Date().toISOString();
+        payment.updatedAt = new Date().toISOString();
+        payments.set(payment.paymentId, payment);
+
+        const refundEvent = createEvent(
+            EventTypes.PAYMENT_REFUNDED,
+            correlationId,
+            serviceName,
+            {
+                paymentId: payment.paymentId,
+                orderId: payment.orderId,
+                amount: payment.amount,
+                reason,
+                originalTransactionRef: payment.transactionRef,
+                status: 'REFUNDED',
+            }
+        );
+
+        await producer.emit(refundEvent);
+
+        logger.info('Payment refunded', {
+            paymentId: payment.paymentId,
+            orderId: payment.orderId,
+            amount: payment.amount,
+            correlation_id: correlationId,
+        });
     }
 
     return {
@@ -337,6 +399,27 @@ function createPaymentHandler(producer, serviceName, options = {}) {
                     });
                 }
 
+                // ---------------------------------------------------------
+                // Cancel-vs-payment race check
+                // ---------------------------------------------------------
+                // The order may have been cancelled while the gateway call
+                // was in flight. If so, refund immediately — otherwise the
+                // charge would be stranded (cancel handler already ran and
+                // found nothing to refund).
+                // ---------------------------------------------------------
+                if (cancelledOrders.has(orderId)) {
+                    const reason = cancelledOrders.get(orderId);
+                    cancelledOrders.delete(orderId);
+
+                    logger.warn('Order was cancelled during payment processing — refunding', {
+                        paymentId,
+                        orderId,
+                        correlation_id: correlationId,
+                    });
+
+                    await processRefund(payment, reason, correlationId);
+                }
+
             } else {
                 // ============= PAYMENT FAILED =============
                 payment.status = 'FAILED';
@@ -406,58 +489,19 @@ function createPaymentHandler(producer, serviceName, options = {}) {
             }
 
             if (!existingPayment) {
-                logger.info('No successful payment found for cancelled order', {
+                // No successful payment YET — but one may be in flight
+                // (gateway call takes ~1s). Record the cancellation so the
+                // success path in onOrderCreated refunds the late charge
+                // instead of stranding the money.
+                cancelledOrders.set(orderId, reason);
+                logger.info('No successful payment found for cancelled order — armed late-refund guard', {
                     orderId,
                     correlation_id: correlationId,
                 });
                 return;
             }
 
-            // Process refund
-            if (!replayMode) {
-                // Normal mode — call refund API
-                logger.info('Processing refund...', {
-                    paymentId: existingPayment.paymentId,
-                    amount: existingPayment.amount,
-                });
-                // In production: await stripe.refunds.create({ charge: existingPayment.transactionRef })
-                await new Promise(resolve => setTimeout(resolve, 500));
-            } else {
-                logger.info('[REPLAY MODE] Skipping refund API call', {
-                    paymentId: existingPayment.paymentId,
-                    amount: existingPayment.amount,
-                });
-            }
-
-            // Update payment record
-            existingPayment.status = 'REFUNDED';
-            existingPayment.refundedAt = new Date().toISOString();
-            existingPayment.updatedAt = new Date().toISOString();
-            payments.set(existingPayment.paymentId, existingPayment);
-
-            // Emit PAYMENT_REFUNDED event
-            const refundEvent = createEvent(
-                EventTypes.PAYMENT_REFUNDED,
-                correlationId,
-                serviceName,
-                {
-                    paymentId: existingPayment.paymentId,
-                    orderId,
-                    amount: existingPayment.amount,
-                    reason,
-                    originalTransactionRef: existingPayment.transactionRef,
-                    status: 'REFUNDED',
-                }
-            );
-
-            await producer.emit(refundEvent);
-
-            logger.info('Payment refunded', {
-                paymentId: existingPayment.paymentId,
-                orderId,
-                amount: existingPayment.amount,
-                correlation_id: correlationId,
-            });
+            await processRefund(existingPayment, reason, correlationId);
         },
     };
 }

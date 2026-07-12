@@ -163,8 +163,13 @@ async function start() {
                 offset: metadata.offset,
             });
 
-            // Route event to appropriate handler
-            switch (event.event_type) {
+            // Route event to appropriate handler.
+            // Errors are caught per-event: an uncaught throw here would
+            // propagate into the kafkajs eachMessage loop and stall this
+            // partition in a crash/retry cycle. Matching order-service and
+            // event-ingestor semantics: log the failure and move on.
+            try {
+                switch (event.event_type) {
                 case EventTypes.ORDER_CREATED:
                     // ---------------------------------------------------
                     // ORDER_CREATED → Process payment
@@ -198,6 +203,15 @@ async function start() {
                         event_id: event.event_id,
                     });
                     break;
+                }
+            } catch (error) {
+                logger.error('Failed to process event — skipping to avoid blocking partition', {
+                    event_type: event.event_type,
+                    event_id: event.event_id,
+                    correlation_id: event.correlation_id,
+                    error: error.message,
+                    stack: error.stack,
+                });
             }
         });
 

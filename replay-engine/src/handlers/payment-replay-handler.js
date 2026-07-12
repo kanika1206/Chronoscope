@@ -25,8 +25,33 @@ const { createLogger } = require('@chronoscope/core');
 // =============================================================================
 // createPaymentReplayHandler() — Factory function
 // =============================================================================
-function createPaymentReplayHandler() {
+// PARAMETERS:
+//   @param {function} getPool — Returns the shared pg Pool (lazy: the pool
+//                               is created by the replayer's connect())
+function createPaymentReplayHandler(getPool) {
     const logger = createLogger('payment-replay-handler');
+
+    // Upsert the full payment row (used by PAYMENT_INITIATED)
+    const UPSERT_PAYMENT = `
+        INSERT INTO payments (payment_id, order_id, amount, status, payment_method, correlation_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+        ON CONFLICT (payment_id) DO UPDATE
+        SET order_id = EXCLUDED.order_id,
+            amount = EXCLUDED.amount,
+            status = EXCLUDED.status,
+            payment_method = EXCLUDED.payment_method,
+            updated_at = EXCLUDED.updated_at
+    `;
+
+    // Status-only transition (SUCCESS / FAILED / REFUNDED). Upsert so a
+    // rebuild works even if PAYMENT_INITIATED fell outside the replay window.
+    const UPSERT_PAYMENT_STATUS = `
+        INSERT INTO payments (payment_id, order_id, status, updated_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (payment_id) DO UPDATE
+        SET status = EXCLUDED.status,
+            updated_at = EXCLUDED.updated_at
+    `;
 
     return {
         // =====================================================================
@@ -80,6 +105,18 @@ function createPaymentReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const createdAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_PAYMENT, [
+                    paymentId,
+                    orderId,
+                    amount,
+                    'INITIATED',
+                    method || 'CREDIT_CARD',
+                    event.correlation_id,
+                    createdAt,
+                ]);
+
                 return {
                     action: 'INITIATE_PAYMENT',
                     description: `Payment ${paymentId} record rebuilt (INITIATED)`,
@@ -90,7 +127,7 @@ function createPaymentReplayHandler() {
                         method,
                         status: 'INITIATED',
                         correlationId: event.correlation_id,
-                        createdAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        createdAt,
                     },
                     blockedSideEffects: ['Payment gateway API call'],
                     applied: true,
@@ -156,6 +193,10 @@ function createPaymentReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const updatedAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_PAYMENT_STATUS, [paymentId, orderId, 'SUCCESS', updatedAt]);
+
                 return {
                     action: 'PAYMENT_SUCCESS',
                     description: `Payment ${paymentId} state rebuilt (SUCCESS)`,
@@ -164,7 +205,7 @@ function createPaymentReplayHandler() {
                         orderId,
                         status: 'SUCCESS',
                         transactionRef,
-                        updatedAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        updatedAt,
                     },
                     blockedSideEffects: [
                         'Confirmation email',
@@ -232,6 +273,10 @@ function createPaymentReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const updatedAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_PAYMENT_STATUS, [paymentId, orderId, 'FAILED', updatedAt]);
+
                 return {
                     action: 'PAYMENT_FAILED',
                     description: `Payment ${paymentId} state rebuilt (FAILED)`,
@@ -241,7 +286,7 @@ function createPaymentReplayHandler() {
                         status: 'FAILED',
                         error,
                         errorCode,
-                        updatedAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        updatedAt,
                     },
                     isFailure: true,
                     blockedSideEffects: ['Retry mechanism', 'Notification emails'],
@@ -300,6 +345,10 @@ function createPaymentReplayHandler() {
             }
 
             if (mode === 'state-rebuild') {
+                const updatedAt = new Date(parseInt(event.timestamp, 10)).toISOString();
+
+                await getPool().query(UPSERT_PAYMENT_STATUS, [paymentId, orderId, 'REFUNDED', updatedAt]);
+
                 return {
                     action: 'PAYMENT_REFUNDED',
                     description: `Payment ${paymentId} state rebuilt (REFUNDED)`,
@@ -308,7 +357,7 @@ function createPaymentReplayHandler() {
                         orderId,
                         status: 'REFUNDED',
                         refundReason: reason,
-                        updatedAt: new Date(parseInt(event.timestamp, 10)).toISOString(),
+                        updatedAt,
                     },
                     blockedSideEffects: ['Refund API call', 'Refund confirmation email'],
                     applied: true,
